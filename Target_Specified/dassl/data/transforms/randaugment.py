@@ -90,7 +90,7 @@ def Solarize(img, v):
 
 
 def SolarizeAdd(img, addition=0, threshold=128):
-    img_np = np.array(img).astype(np.int)
+    img_np = np.array(img).astype(np.int32)
     img_np = img_np + addition
     img_np = np.clip(img_np, 0, 255)
     img_np = img_np.astype(np.uint8)

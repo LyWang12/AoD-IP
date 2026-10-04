@@ -27,12 +27,12 @@ class miniDomainNet(DatasetBase):
         )
 
         train_x = self._read_data(cfg.DATASET.SOURCE_DOMAINS, split="train")
-        train_expend = self._read_data(cfg.DATASET.SOURCE_DOMAINS, split="train")
         train_u = self._read_data(cfg.DATASET.TARGET_DOMAINS, split="train")
         test_x = self._read_data(cfg.DATASET.SOURCE_DOMAINS, split="test")
         test_u = self._read_data(cfg.DATASET.TARGET_DOMAINS, split="test")
 
-        super().__init__(train_x=train_x, train_u=train_u, train_expend=train_expend, test_x=test_x, test_u=test_u)
+        super().__init__(train_x=train_x, train_u=train_u,
+                         test_x=test_x, test_u=test_u)
 
     def _read_data(self, input_domains, split="train"):
         items = []
@@ -52,7 +52,7 @@ class miniDomainNet(DatasetBase):
                     item = Datum(
                         impath=impath,
                         label=label,
-                        domain=domain,
+                        domain=dname,
                         classname=classname
                     )
                     items.append(item)

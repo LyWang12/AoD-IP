@@ -23,6 +23,7 @@ def build_data_loader(
     dataset_wrapper=None,
     mode="norm"
 ):
+    # Build sampler
     sampler = build_sampler(
         sampler_type,
         cfg=cfg,
@@ -33,6 +34,7 @@ def build_data_loader(
     )
     dataset_wrapper = DatasetWrapper
 
+    # Build data loader
     data_loader = torch.utils.data.DataLoader(
         dataset_wrapper(cfg, data_source, transform=tfm, is_train=is_train, mode=mode),
         batch_size=batch_size,
@@ -55,8 +57,10 @@ class DataManager:
         custom_tfm_test=None,
         dataset_wrapper=None
     ):
+        # Load dataset
         dataset = build_dataset(cfg)
 
+        # Build transform
         if custom_tfm_train is None:
             tfm_train = build_transform(cfg, is_train=True)
         else:
@@ -72,6 +76,7 @@ class DataManager:
             print("* Using custom transform for testing")
             tfm_test = custom_tfm_test
 
+        # Build train_loader_x
         train_loader_x = build_data_loader(
             cfg,
             sampler_type=cfg.DATALOADER.TRAIN_X.SAMPLER,
@@ -108,6 +113,7 @@ class DataManager:
             dataset_wrapper=dataset_wrapper
         )
 
+
         test_loader_x = build_data_loader(
             cfg,
             sampler_type=cfg.DATALOADER.TEST.SAMPLER,
@@ -128,16 +134,21 @@ class DataManager:
             dataset_wrapper=dataset_wrapper
         )
 
+
+
+        # Attributes
         self._num_classes = dataset.num_classes
         self._num_source_domains = len(cfg.DATASET.SOURCE_DOMAINS)
         self._lab2cname = dataset.lab2cname
 
+        # Dataset and data-loaders
         self.dataset = dataset
         self.train_loader_x = train_loader_x
         self.train_loader_u = train_loader_u
         self.train_loader_e = train_loader_e
         self.test_loader_x = test_loader_x
         self.test_loader_u = test_loader_u
+
 
         if cfg.VERBOSE:
             self.show_dataset_summary(cfg)
@@ -171,6 +182,7 @@ class DataManager:
         table.append(["# train_u", self.dataset.train_u[0].domain, f"{len(self.dataset.train_u):,}"])
         table.append(["# test_x", self.dataset.test_x[0].domain, f"{len(self.dataset.test_x):,}"])
         table.append(["# test_u", self.dataset.test_u[0].domain, f"{len(self.dataset.test_u):,}"])
+
         print(tabulate(table))
 
 
@@ -179,9 +191,10 @@ class DatasetWrapper(TorchDataset):
     def __init__(self, cfg, data_source, transform=None, is_train=False, mode="norm"):
         self.cfg = cfg
         self.data_source = data_source
-        self.transform = transform
+        self.transform = transform  # accept list (tuple) as input
         self.is_train = is_train
         self.mode = mode
+        # Augmenting an image K>1 times is only allowed during training
         self.k_tfm = cfg.DATALOADER.K_TRANSFORMS if is_train else 1
 
         if self.k_tfm > 1 and transform is None:
@@ -190,6 +203,7 @@ class DatasetWrapper(TorchDataset):
                 "because transform is None".format(self.k_tfm)
             )
 
+        # Build transform that doesn't apply any data augmentation
         interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
         to_tensor = []
         to_tensor += [T.Resize(cfg.INPUT.SIZE, interpolation=interp_mode)]
@@ -220,6 +234,7 @@ class DatasetWrapper(TorchDataset):
             img = img_tr
         elif self.mode == "watermark":
             img = self._add_watermark(img_tr)
+            # img = img_tr
 
         output["img"] = img
 

@@ -2,8 +2,6 @@ import os.path as osp
 import os
 import datetime
 import time
-from collections import OrderedDict
-from einops import rearrange
 from collections import defaultdict
 import json
 import torch
@@ -11,7 +9,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-from torchvision import transforms
 
 from dassl.engine import TRAINER_REGISTRY, TrainerXU
 from dassl.metrics import compute_accuracy
@@ -151,32 +148,34 @@ class PromptLearner(nn.Module):
         n_ctx = 24 + n_imgctx
 
         dtype = clip_model.dtype
-        clip_imsize = clip_model.visual.input_resolution
-        cfg_imsize = cfg.INPUT.SIZE[0]
+        clip_imsize = clip_model.visual.input_resolution  # 224
+        cfg_imsize = cfg.INPUT.SIZE[0]   # 224
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         self.domain_tokens = domain_projector()
         self.image_tokens = image_projector()
         self.style_mapping_tokens = style_mapping_projector()
 
-        prompt_prefix = " ".join(["X"] * n_ctx)
+        prompt_prefix = " ".join(["X"] * n_ctx)  # 'X X X X X X X X X X X X X X X X X X X X X X X X X X X X'
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        print(tokenized_prompts.shape)
 
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
-        self.register_buffer("token_prefix", embedding[:, :1, :])
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])
+        # These token vectors will be saved when in save_model(),
+        # but they should be ignored in load_model() as we want to use
+        # those computed using the current class names
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
         self.K = 5
-        self.dim = clip_model.text_projection.shape[1]
+        self.dim = clip_model.text_projection.shape[1]   # 512
         self.n_imgctx = n_imgctx
         self.tokenized_prompts = tokenized_prompts
         self.name_lens = name_lens
@@ -198,9 +197,9 @@ class PromptLearner(nn.Module):
     @autocast()
 
     def forward(self, data, scr_feat=None):
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        n_imgctx = self.n_imgctx
+        prefix = self.token_prefix  # 66,1,512
+        suffix = self.token_suffix  # 66,48,512
+        n_imgctx = self.n_imgctx  # 4
 
         domaintokens = self.domain_tokens(data)
         imagetokens = self.image_tokens(data, n_imgctx)
@@ -211,12 +210,13 @@ class PromptLearner(nn.Module):
             tokens = torch.cat((domaintokens, domaintokens, imagetokens), dim=1)
 
         prompts = []
-        for tokens_i in tokens:
+        for tokens_i in tokens:  # 28,512
             ctx_i = tokens_i.unsqueeze(0).expand(self.n_cls, -1, -1)
             pts_i = self.construct_prompts(ctx_i, prefix, suffix)
             prompts.append(pts_i)
 
         prompts = torch.stack(prompts)
+
         return prompts, domaintokens
 
 
@@ -238,11 +238,11 @@ class ScrectEncoder(nn.Module):
             nn.LayerNorm(pre_dim2),
             nn.ReLU(inplace=True),
             nn.Linear(pre_dim2, input_dim)
-        ).half()
+        )
 
         self.post_project = nn.Sequential(
             nn.Linear(input_dim, input_dim)
-        ).half()
+        )
 
         self.logit_scale = clip_model.logit_scale
 
@@ -264,9 +264,9 @@ class CustomCLIP(nn.Module):
         self.dtype = clip_model.dtype
         self.n_cls = self.prompt_learner.n_cls
         self.K = 5
-        self.dim = clip_model.text_projection.shape[1]
+        self.dim = clip_model.text_projection.shape[1]   # 512
         self.feat_bank = {}
-        self.bank_file = "bank.json"
+        self.bank_file = f"bank_{cfg.DATASET.NAME}.json"
         self.cfg = cfg
     def _load_bank_dict(self):
         try:
@@ -321,7 +321,7 @@ class CustomCLIP(nn.Module):
     def finalize_domain_bank(self):
         valid_indices = [i for i, p in enumerate(self._domain_max_probs_list) if p != 0]
         if len(valid_indices) > 0:
-            local_feats = self._domain_feat_bank[valid_indices]
+            local_feats = self._domain_feat_bank[valid_indices]  # 当前 GPU
             world_size = dist.get_world_size() if dist.is_initialized() else 1
             print(self._cur_domain)
             if world_size > 1:
@@ -349,7 +349,7 @@ class CustomCLIP(nn.Module):
         del self._cur_domain
 
     @autocast()
-    def forward(self, s_image, t_image=None, e_image=None, domain=None, mode=None):
+    def forward(self, s_image, t_image=None, e_image=None, label=None, domain=None, mode=None):
         if mode == "testing":
             image = s_image
             image_features, data = self.image_encoder(image.type(self.dtype))
@@ -358,7 +358,7 @@ class CustomCLIP(nn.Module):
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             text_features = self.encode_text_features(prompts)
             logits = self.compute_logits(text_features, image_features)
-            return logits
+            return logits   # B,66
 
         elif mode == "constructing":
             image = s_image
@@ -371,6 +371,7 @@ class CustomCLIP(nn.Module):
             return logits, image_features, domaintokens, text_features
 
         elif mode == "training":
+            # image features
             source_image_features, source_data = self.image_encoder(s_image.type(self.dtype))
             target_image_features, target_data = self.image_encoder(t_image.type(self.dtype))
             expend_image_features, expend_data = self.image_encoder(e_image.type(self.dtype))
@@ -385,17 +386,17 @@ class CustomCLIP(nn.Module):
             target_image_features = target_image_features / target_image_features.norm(dim=-1, keepdim=True)
             expend_image_features = expend_image_features / expend_image_features.norm(dim=-1, keepdim=True)
 
+            # text features
             source_text_features_with_author_scr = self.encode_text_features(source_prompts_with_author_scr)
             target_text_features_with_author_scr = self.encode_text_features(target_prompts_with_author_scr)
             expend_text_features_with_author_scr = self.encode_text_features(expend_prompts_with_author_scr)
 
+            # logits
             logits_source_with_author_scr = self.compute_logits(source_text_features_with_author_scr, source_image_features)
             logits_target_with_author_scr = self.compute_logits(target_text_features_with_author_scr, target_image_features)
             logits_expend_with_author_scr = self.compute_logits(expend_text_features_with_author_scr, expend_image_features)
 
             return logits_source_with_author_scr, logits_target_with_author_scr, logits_expend_with_author_scr, source_text_features_with_author_scr, expend_text_features_with_author_scr
-
-
 
         else:
             print("Error mode")
@@ -480,9 +481,10 @@ class IPCLIPB16(TrainerXU):
         print('classnames', classnames, len(classnames))
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
-        self.dim = clip_model.text_projection.shape[1]
+        self.dim = clip_model.text_projection.shape[1]   # 512
 
         if cfg.TRAINER.IPCLIPB16.PREC == "fp32" or cfg.TRAINER.IPCLIPB16.PREC == "amp":
+            # CLIP's default precision is fp16
             clip_model.float()
 
         print("Building custom CLIP")
@@ -491,10 +493,12 @@ class IPCLIPB16(TrainerXU):
 
         name_to_update = ["prompt_learner", "screct_encoder"]
 
+        # 冻结prompt_learner以外的层
         for name, param in self.model.named_parameters():
             if not any(kw in name for kw in name_to_update):
                 param.requires_grad_(False)
 
+        # Double check
         enabled = set()
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -518,7 +522,8 @@ class IPCLIPB16(TrainerXU):
         else:
             raise ValueError
 
-        self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
+        # prompt_learner and screct_encoder share one optimizer; both are saved/resumed
+        self.optim = build_optimizer(nn.ModuleList([self.model.prompt_learner, self.model.screct_encoder]), cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         '''
         register model could be updated. When new module needs to be updated
@@ -526,6 +531,7 @@ class IPCLIPB16(TrainerXU):
         '''
         self.register_model("prompt_learner", self.model.prompt_learner,
                             self.optim, self.sched)
+        self.register_model("screct_encoder", self.model.screct_encoder)
 
         self.scaler = GradScaler() if cfg.TRAINER.IPCLIPB16.PREC == "amp" else None
         self.construct_bank_before_training()
@@ -552,9 +558,10 @@ class IPCLIPB16(TrainerXU):
             if cache_hit:
                 print(f"[bank] hit cache for '{domain}', skip constructing loop.")
                 continue
-            for batch_idx, batch in enumerate(loader):
+            pbar = tqdm(enumerate(loader), total=len(loader), desc=f"construct {domain} feature bank")
+            for batch_idx, batch in pbar:
                 inputs, labels = self.parse_batch_test(batch)
-                logits, features, _, _ = self.model(inputs, domain=domain, mode="constructing")
+                logits, features, _, _ = self.model(inputs, label=labels, domain=domain, mode="constructing")
                 self.model.update_domain_bank(logits, features, labels)
             self.model.finalize_domain_bank()
             print(f"{domain.capitalize()} feature banks are completed!")
@@ -602,6 +609,7 @@ class IPCLIPB16(TrainerXU):
         batch_time = AverageMeter()
         data_time = AverageMeter()
 
+        # Decide to iterate over labeled or unlabeled dataset
         len_train_loader_x = len(self.train_loader_x)
         len_train_loader_u = len(self.train_loader_u)
         len_train_loader_e = len(self.train_loader_e)
@@ -618,6 +626,7 @@ class IPCLIPB16(TrainerXU):
         train_loader_x_iter = iter(self.train_loader_x)
         train_loader_u_iter = iter(self.train_loader_u)
         train_loader_e_iter = iter(self.train_loader_e)
+
 
         end = time.time()
         for self.batch_idx in range(self.num_batches):
@@ -679,6 +688,7 @@ class IPCLIPB16(TrainerXU):
 
 
     def forward_backward(self, batch_s, batch_t, batch_e):
+        # B,3,224,224
         self.entropy = entropy_loss()
         kl_loss = nn.KLDivLoss(reduction="batchmean")
         image_s, label_s, image_t, label_t, image_e, label_e = self.parse_batch_train(batch_s, batch_t, batch_e)
@@ -686,13 +696,12 @@ class IPCLIPB16(TrainerXU):
         prec = self.cfg.TRAINER.IPCLIPB16.PREC
         if prec == "amp":
             with autocast():
-                logits_source_with_author_scr, logits_target_with_author_scr, logits_expend_with_author_scr, source_text_features_with_author_scr, expend_text_features_with_author_scr = self.model(image_s, image_t, image_e, mode='training')
+                logits_source_with_author_scr, logits_target_with_author_scr, logits_expend_with_author_scr, source_text_features_with_author_scr, expend_text_features_with_author_scr = self.model(image_s, image_t, image_e, mode='training')  # B,3,224,224
                 loss_ce_s_with_a_scr = F.cross_entropy(logits_source_with_author_scr, label_s)
                 label_u = torch.full_like(label_s, self.n_cls-1)
                 loss_ce_s_with_a_scr_u = F.cross_entropy(logits_source_with_author_scr, label_u)
                 loss_ce_t_with_a_scr = F.cross_entropy(logits_target_with_author_scr, label_u)
                 loss_ce_e_with_a_scr = F.cross_entropy(logits_expend_with_author_scr, label_u)
-
                 source_textfeat_a = F.log_softmax(source_text_features_with_author_scr, dim=1)
                 expend_textfeat_a = F.softmax(expend_text_features_with_author_scr, dim=1)
                 loss_kl_ae = kl_loss(source_textfeat_a, expend_textfeat_a)
@@ -720,7 +729,8 @@ class IPCLIPB16(TrainerXU):
             "loss_kl_ae": loss_kl_ae.item(),
         }
 
-        self.update_lr()
+        if (self.batch_idx + 1) == self.num_batches:  # step the scheduler once per epoch
+            self.update_lr()
 
         return loss_summary
 
@@ -771,6 +781,7 @@ class IPCLIPB16(TrainerXU):
 
         names = self.get_model_names()
 
+        # By default, the best model is loaded
         model_file = "model-best.pth.tar"
 
         if epoch is not None:
@@ -787,6 +798,7 @@ class IPCLIPB16(TrainerXU):
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint["epoch"]
 
+            # Ignore fixed token vectors
             if "token_prefix" in state_dict:
                 del state_dict["token_prefix"]
 
@@ -795,6 +807,7 @@ class IPCLIPB16(TrainerXU):
 
             print("Loading weights to {} "
                   'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
 
 
@@ -802,17 +815,26 @@ class IPCLIPB16(TrainerXU):
     def test(self, domain_scr):
 
         self.set_model_mode("eval")
+
         test_loaders = {
             self.cfg.DATASET.SOURCE_DOMAINS[0]: self.test_loader_x,
             self.cfg.DATASET.TARGET_DOMAINS[0]: self.test_loader_u,
         }
         results_dict = defaultdict(dict)
         for domain, loader in test_loaders.items():
-            self.evaluator.reset()
-            print(f"Evaluate on the *{domain}* set for all class")
+            # Run the forward pass once per domain and reuse the outputs for
+            # both metrics (all-class accuracy and "unauthorized" accuracy).
+            outputs, labels = [], []
+            print(f"Evaluate on the *{domain}* set")
             for batch_idx, batch in enumerate(tqdm(loader)):
                 input, label = self.parse_batch_test(batch)
                 output = self.model_inference(input=input, domain=domain_scr, mode='testing')
+                outputs.append(output)
+                labels.append(label)
+
+            self.evaluator.reset()
+            print(f"[{domain}] result for all class (acc_all):")
+            for output, label in zip(outputs, labels):
                 self.evaluator.process(output, label)
             results = self.evaluator.evaluate()
             for k, v in results.items():
@@ -820,13 +842,10 @@ class IPCLIPB16(TrainerXU):
                 self.write_scalar(tag, v, self.epoch)
             results_dict[domain]["acc_all"] = list(results.values())[0]
 
-
             self.evaluator.reset()
-            print(f"Evaluate on the *{domain}* set for unauthorized class")
-            for batch_idx, batch in enumerate(tqdm(loader)):
-                input, label = self.parse_batch_test(batch)
-                output = self.model_inference(input=input, domain=domain_scr, mode='testing')
-                label_au = torch.full_like(label, self.n_cls-1)
+            print(f"[{domain}] result for unauthorized class (acc_auth):")
+            for output, label in zip(outputs, labels):
+                label_au = torch.full_like(label, self.n_cls-1)  # 创建新张量，值为 65
                 self.evaluator.process(output, label_au)
             results = self.evaluator.evaluate()
             for k, v in results.items():
@@ -834,3 +853,6 @@ class IPCLIPB16(TrainerXU):
                 self.write_scalar(tag, v, self.epoch)
             results_dict[domain]["acc_auth"] = list(results.values())[0]
         return results_dict
+
+
+
