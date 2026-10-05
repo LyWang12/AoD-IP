@@ -41,7 +41,7 @@ def build_data_loader(
         sampler=sampler,
         num_workers=cfg.DATALOADER.NUM_WORKERS,
         drop_last=is_train and len(data_source) >= batch_size,
-        pin_memory=(torch.cuda.is_available() and cfg.USE_CUDA)
+        pin_memory=False  # pin_memory threads deadlocked with CUDA after a few iterations on this machine
     )
     assert len(data_loader) > 0
 
